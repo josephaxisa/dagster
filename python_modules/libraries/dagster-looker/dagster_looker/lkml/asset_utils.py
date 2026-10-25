@@ -1,3 +1,5 @@
+import posixpath
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import AbstractSet, Any, NamedTuple  # noqa: UP035
@@ -11,6 +13,8 @@ from dagster_looker.lkml.dagster_looker_lkml_translator import (
     DagsterLookerLkmlTranslator,
     LookMLStructureType,
 )
+
+IMPORTED_PROJECTS_DIR = "imported_projects"
 
 
 def deep_merge_objs(onto_obj: Any, from_obj: Any) -> Any:
@@ -162,17 +166,143 @@ def build_looker_explore_specs(
     return looker_explore_specs
 
 
+def _get_project_root(project_dir: Path, lookml_path: Path) -> Path:
+    """Returns the root of the project a file belongs to. Files of an imported project are
+    checked out under `imported_projects/<project_name>/`.
+    """
+    relative_parts = lookml_path.relative_to(project_dir).parts
+    if len(relative_parts) > 2 and relative_parts[0] == IMPORTED_PROJECTS_DIR:
+        return project_dir.joinpath(*relative_parts[:2])
+
+    return project_dir
+
+
+def _build_include_pattern_regex(pattern: str) -> re.Pattern[str]:
+    """Translates an include pattern, relative to a project root, into a regex. `*` matches
+    within one directory and a `**` directory matches any number of directories.
+    """
+    segments = pattern.split("/")
+    regex = ""
+    for i, segment in enumerate(segments):
+        if segment == "**":
+            regex += r"(?:[^/]+/)*"
+        else:
+            regex += re.escape(segment).replace(r"\*", "[^/]*")
+            if i < len(segments) - 1:
+                regex += "/"
+
+    return re.compile(regex)
+
+
+def _resolve_include(
+    project_dir: Path,
+    lookml_paths: Sequence[Path],
+    including_path: Path,
+    include: str,
+) -> Sequence[Path]:
+    """Returns the files an `include` statement matches, in path order.
+
+    https://cloud.google.com/looker/docs/reference/param-model-include
+    """
+    if include.startswith("//"):
+        imported_project_name, _, pattern = include[2:].partition("/")
+        root = project_dir / IMPORTED_PROJECTS_DIR / imported_project_name
+    else:
+        root = _get_project_root(project_dir, including_path)
+        if include.startswith("/"):
+            pattern = include[1:]
+        else:
+            pattern = posixpath.normpath(
+                (including_path.parent.relative_to(root) / include).as_posix()
+            )
+
+    # The file extension can be left out of an include, for example `/views/*.view`.
+    if not pattern.endswith((".lkml", ".lookml")):
+        pattern += ".lkml"
+    pattern_regex = _build_include_pattern_regex(pattern)
+
+    resolved_paths = []
+    for lookml_path in lookml_paths:
+        if not lookml_path.is_relative_to(root):
+            continue
+        relative_path = lookml_path.relative_to(root).as_posix()
+        # A pattern of the current project never matches the files of an imported project.
+        if root == project_dir and relative_path.startswith(f"{IMPORTED_PROJECTS_DIR}/"):
+            continue
+        if pattern_regex.fullmatch(relative_path):
+            resolved_paths.append(lookml_path)
+
+    return resolved_paths
+
+
+def _load_lookml_files_in_include_order(project_dir: Path) -> Mapping[Path, Mapping[str, Any]]:
+    """Loads the LookML files that the project's models include, in the order Looker reads
+    them: each included file's own includes come before the file, a file is read once at the
+    position it is first included, and each model file comes after the files it includes.
+    Model files of imported projects are not models of this project, so they are skipped.
+
+    https://cloud.google.com/looker/docs/lookml-refinements#refinements_are_applied_in_order
+    """
+    lookml_paths = sorted(
+        lookml_path
+        for lookml_path in project_dir.rglob("*.lkml")
+        if not lookml_path.name.endswith(".dashboard.lkml")
+    )
+
+    visited_paths: set[Path] = set()
+    loaded_lookml_by_path: dict[Path, Mapping[str, Any]] = {}
+
+    def visit(lookml_path: Path) -> None:
+        if lookml_path in visited_paths:
+            return
+        visited_paths.add(lookml_path)
+
+        loaded_lookml = lkml.load(lookml_path.read_text(encoding="utf-8"))
+        for include in loaded_lookml.get("includes", []):
+            for included_path in _resolve_include(project_dir, lookml_paths, lookml_path, include):
+                visit(included_path)
+
+        loaded_lookml_by_path[lookml_path] = loaded_lookml
+
+    for lookml_path in lookml_paths:
+        if (
+            lookml_path.name.endswith(".model.lkml")
+            and _get_project_root(project_dir, lookml_path) == project_dir
+        ):
+            visit(lookml_path)
+
+    return loaded_lookml_by_path
+
+
 def build_looker_view_specs(
     project_dir: Path,
     dagster_looker_translator: DagsterLookerLkmlTranslator,
 ) -> Sequence[AssetSpec]:
 
+    # Views and refinements are read in include order, so that refinements apply in the order
+    # Looker applies them. They can be declared in any included LookML file, not only in
+    # `.view.lkml` files. View files that no model includes are still read, in path order,
+    # before the included files, so that what the models include takes precedence.
+    #
     # https://cloud.google.com/looker/docs/reference/param-view
+    # https://cloud.google.com/looker/docs/lookml-refinements
+    included_lookml_by_path = _load_lookml_files_in_include_order(project_dir)
+    not_included_view_paths = sorted(
+        set(project_dir.rglob("*.view.lkml")) - included_lookml_by_path.keys()
+    )
+    lookml_by_path = {
+        **{
+            lookml_view_path: lkml.load(lookml_view_path.read_text(encoding="utf-8"))
+            for lookml_view_path in not_included_view_paths
+        },
+        **included_lookml_by_path,
+    }
+
     views: list[LookMLStructure] = []
-    for lookml_view_path in project_dir.rglob("*.view.lkml"):
+    for lookml_path, loaded_lookml in lookml_by_path.items():
         views.extend(
-            LookMLStructure(lookml_view_path, "view", lookml_view_props)
-            for lookml_view_props in lkml.load(lookml_view_path.read_text()).get("views", [])
+            LookMLStructure(lookml_path, "view", lookml_view_props)
+            for lookml_view_props in loaded_lookml.get("views", [])
         )
     views_postprocessed = postprocess_loaded_structures(views)
 

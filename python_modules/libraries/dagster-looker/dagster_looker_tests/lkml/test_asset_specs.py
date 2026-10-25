@@ -13,6 +13,7 @@ from dagster_looker.lkml.dagster_looker_lkml_translator import (
 from dagster_looker_tests.looker_projects import (
     test_exception_derived_table_path,
     test_extensions,
+    test_include_order,
     test_liquid_path,
     test_refinements,
     test_retail_demo_path,
@@ -331,6 +332,24 @@ def test_refinement_views(caplog: pytest.LogCaptureFixture):
 
     # Ensure we get the asset key from the refined view
     assert next(iter(spec.deps)).asset_key == AssetKey(["prod", "new_base_data"])
+
+
+def test_refinements_apply_in_include_order() -> None:
+    specs = build_looker_asset_specs(project_dir=test_include_order)
+    asset_deps = {spec.key: {dep.asset_key for dep in spec.deps} for spec in specs}
+
+    assert asset_deps == {
+        AssetKey(["explore", "orders"]): {AssetKey(["view", "orders"])},
+        # Refinements in `.layer.lkml` files are read, and the one included last wins, even
+        # though it comes first in path order.
+        AssetKey(["view", "orders"]): {AssetKey(["analytics", "orders_a"])},
+        # Refinements declared in the model file are read.
+        AssetKey(["view", "customers"]): {AssetKey(["analytics", "customers"])},
+        # The view the model includes from the imported project takes precedence over a view
+        # file with the same view that no model includes. The imported project's own model
+        # is not a model of this project, so the refinement it includes is not applied.
+        AssetKey(["view", "users"]): {AssetKey(["shared", "users"])},
+    }
 
 
 def test_extension_views(caplog: pytest.LogCaptureFixture):
